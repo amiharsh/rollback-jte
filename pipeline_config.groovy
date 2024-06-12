@@ -19,4 +19,6 @@ keywords{
     application_name = "WindowsApplication" // Required - Actual Application name (ex. VOR, AMI, BDP, SCP)
     service = "Web" // Required
     fortify_scan_enabled=true
+    rollback_enabled=true
+    rollback_branch="test"
 }

@@ -1,0 +1,460 @@
+/* groovylint-disable DuplicateMapLiteral, NestedBlockDepth */
+
+CR_TICKET = null
+APPROVAL_TIMEOUT = [time: 7, unit: 'DAYS']
+
+pipeline {
+  agent none
+  parameters {
+    
+  }
+  options {
+      datadog(
+        collectLogs: true,
+        tags: ["application:${application_name}", "service:${service}"]
+      )
+      buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '5'))
+  }
+  environment {
+    BUILD_OS = set_os()
+    BUILD_ARCH = set_arch()
+    BUILD_ENV_CRED = set_cred()
+    BUILD_ENV_URL = set_url()
+    BUILD_ENV_TAG = set_tag()
+    BUILD_ENV_MOUNT_DOCKER_SOCKET = set_docker_socket_mount()
+  }
+  stages {
+    stage('Validation') {
+      when {
+        expression { return (currentBuild.result != 'ABORTED' && !rollback_enabled) }
+        beforeAgent true
+      }
+      steps { script {
+        print_build_details()
+        validate_build_details()
+      } }
+    }
+    stage('Source Control') {
+      when {
+        expression { return (currentBuild.result != 'ABORTED' ) }
+        beforeAgent true
+      }
+      agent { label "${BUILD_ARCH} && ${BUILD_OS}" }
+      steps {
+        cleanWs deleteDirs: true, disableDeferredWipeout: true
+        checkout_scm()
+        stash 'source'
+        script {
+          env.COMMITTER_EMAIL = get_scm_variable('committer_email')
+          echo "Committer email: ${COMMITTER_EMAIL}"
+          env.MERGED_BRANCH = get_merged_branch()
+        }
+      }
+    }
+    stage('Jira Ticket') {
+        when {
+            expression {
+                return (!rollback_enabled) && (triggered_by('merge', to: 'master') && currentBuild.result != 'ABORTED')
+            }
+            beforeAgent true
+        }
+      stages {
+        stage('Input Ticket') {
+          steps {
+            script {
+              env.TICKET_ID = approve_for prod,
+                                          timeoutAfter: APPROVAL_TIMEOUT,
+                                          promptTicket: true,
+                                          approvers: dev_leads
+              echo "TicketID: ${TICKET_ID}"
+            }
+          }
+        }
+        stage('Get Ticket') {
+          agent { label "${BUILD_ARCH} && ${BUILD_OS}" }
+          steps {
+            script {
+              CR_TICKET = get_ticket TICKET_ID
+              echo "Ticket: ${CR_TICKET}"
+              if (CR_TICKET.status != 'Awaiting implementation' && CR_TICKET.status != 'Implementing') {
+                env.ERROR = "Ticket must have status 'Awaiting implementation' or 'Implementing' before deploying."
+                error(ERROR)
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Build Environment') {
+      when {
+        expression { return (currentBuild.result != 'ABORTED') }
+        beforeAgent true
+      }
+      agent { label "${BUILD_ARCH} && ${BUILD_OS}" }
+      steps {
+        unstash 'source'
+        script {
+          Boolean imageNeedsUpdate = get_build_environment()
+          if (imageNeedsUpdate) {
+              update_build_environment()
+          } else {
+              echo 'No image update necessary.'
+          }
+        }
+      }
+    }
+    stage('Pre-Stage Checks') {
+    when {
+        expression {
+            return (!rollback_enabled) && (currentBuild.result != 'ABORTED')
+        }
+        beforeAgent true
+    }
+      agent { label "${BUILD_ARCH} && ${BUILD_OS}" }
+      stages {
+        stage('Pre-Stage Build') {
+          when { expression { return pre_stage_build_enabled } }
+          steps {
+            script {
+              docker.withRegistry(env.BUILD_ENV_URL, env.BUILD_ENV_CRED) {
+                  docker.image(env.BUILD_ENV_TAG).inside(BUILD_ENV_MOUNT_DOCKER_SOCKET) {
+                    unstash 'source'
+                    pre_stage_build()
+                    stash 'prebuild'
+                  }
+              }
+            }
+          }
+        }
+        stage('Scan') {
+          steps {
+            script {
+              if (pre_stage_build_enabled) {
+                unstash 'prebuild'
+              }
+              else {
+                unstash 'source'
+              }
+            }
+            static_code_vulnerability_scan() // No Assessment Units available...
+            open_source_vulnerability_scan()
+          }
+        }
+        stage('Automated Unit Test') {
+          steps {
+            script {
+              docker.withRegistry(env.BUILD_ENV_URL, env.BUILD_ENV_CRED) {
+                  docker.image(env.BUILD_ENV_TAG).inside(BUILD_ENV_MOUNT_DOCKER_SOCKET) {
+                    if (pre_stage_build_enabled) {
+                      unstash 'prebuild'
+                    }
+                    else {
+                      unstash 'source'
+                    }
+                    on_merge to: develop, { test_for dev }
+                    on_pull_request to: develop, { test_for dev }
+                    on_merge to: master, { test_for prod }
+                    on_pull_request to: master, { test_for prod }
+                  }
+              }
+            }
+          }
+        }
+      }
+      post {
+        cleanup {
+          cleanWs deleteDirs: true, disableDeferredWipeout: true
+        }
+      }
+    }
+    stage('Approve - Dev') {
+      when {
+        expression {
+          return triggered_by('pull_request', from: feature, to: develop) &&
+          (currentBuild.result != 'ABORTED') && (!rollback_enabled)
+        }
+      }
+      steps {
+        approve_for dev, timeoutAfter: APPROVAL_TIMEOUT, approvers: "${COMMITTER_EMAIL},${dev_leads}"
+      }
+    }
+    stage('Dev') {
+      when {
+        expression {
+          return triggered_by('pull_request', from: feature, to: develop) &&
+          (currentBuild.result != 'ABORTED') && (!rollback_enabled)
+        }
+        beforeAgent true
+      }
+      agent {
+          docker {
+              label "${BUILD_ARCH} && ${BUILD_OS}"
+              image env.BUILD_ENV_TAG
+              registryCredentialsId env.BUILD_ENV_CRED
+              registryUrl env.BUILD_ENV_URL
+              args BUILD_ENV_MOUNT_DOCKER_SOCKET
+          }
+      }
+      stages {
+        stage('Build') {
+          steps {
+            unstash 'source'
+            build_for dev
+          }
+          post {
+            failure {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+            aborted {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+          }
+        }
+        stage('Deploy') {
+          steps {
+            deploy_to dev
+          }
+          post {
+            cleanup {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+          }
+        }
+      }
+    }
+    stage('Approve - Dev Testing Complete') {
+      when {
+        expression {
+          return triggered_by('pull_request', from: feature, to: develop) &&
+          (currentBuild.result != 'ABORTED')
+        }
+      }
+      steps {
+        approve_for dev, timeoutAfter: APPROVAL_TIMEOUT, approvers: "${COMMITTER_EMAIL},${dev_leads}", transition: true
+      }
+    }
+    stage('Approve - QA') {
+      when {
+        expression { return(
+          (triggered_by('pull_request', from: feature, to: develop)) ||
+          (triggered_by('merge', from: feature, to: develop)) ||
+          (triggered_by('pull_request', from: release, to: master)) ||
+          (triggered_by('pull_request', from: hotfix, to: master))) && 
+          (currentBuild.result != 'ABORTED') &&
+          (!rollback_enabled)
+          } 
+      }
+      steps {
+        approve_for qa, timeoutAfter: APPROVAL_TIMEOUT, approvers: qa_leads
+      }
+    }
+    stage('QA') {
+      when {
+        expression { return(
+          (triggered_by('pull_request', from: feature, to: develop)) ||
+          (triggered_by('merge', from: feature, to: develop)) ||
+          (triggered_by('pull_request', from: release, to: master)) ||
+          (triggered_by('pull_request', from: hotfix, to: master))) && 
+          (currentBuild.result != 'ABORTED') &&
+          (!rollback_enabled)
+          }
+        beforeAgent true
+      }
+      agent {
+          docker {
+              label "${BUILD_ARCH} && ${BUILD_OS}"
+              image env.BUILD_ENV_TAG
+              registryCredentialsId env.BUILD_ENV_CRED
+              registryUrl env.BUILD_ENV_URL
+              args BUILD_ENV_MOUNT_DOCKER_SOCKET
+          }
+      }
+      stages {
+        stage('Build') {
+          steps {
+            unstash 'source'
+            build_for qa
+          }
+          post {
+            failure {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+            aborted {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+          }
+        }
+        stage('Deploy') {
+          steps {
+            deploy_to qa
+          }
+          post {
+            cleanup {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+          }
+        }
+      }
+    }
+    stage('Approve - QA Testing Complete') {
+      when {
+        expression { return(
+          ((triggered_by('pull_request', from: release, to: master)) ||
+          (triggered_by('pull_request', from: hotfix, to: master)))) && 
+          (currentBuild.result != 'ABORTED') && 
+          (!rollback_enabled)
+           }
+      }
+      steps {
+        approve_for qa, timeoutAfter: APPROVAL_TIMEOUT, approvers: qa_leads, transition: true
+      }
+    }
+    stage('Approve - Staging') {
+      when {
+        expression {
+          return(
+          ((triggered_by('pull_request', from: release, to: master)) ||
+          (triggered_by('pull_request', from: hotfix, to: master)))) && 
+          (currentBuild.result != 'ABORTED') &&
+          !(bypassing_staging()) &&
+          (!rollback_enabled)
+        }
+      }
+      steps {
+        approve_for staging, timeoutAfter: APPROVAL_TIMEOUT, approvers: qa_leads
+      }
+    }
+    stage('Staging') {
+      when {
+        expression {
+          return(
+          ((triggered_by('pull_request', from: release, to: master)) ||
+          (triggered_by('pull_request', from: hotfix, to: master)))) && 
+          (currentBuild.result != 'ABORTED') &&
+          !(bypassing_staging()) &&
+          (!rollback_enabled)
+        }
+        beforeAgent true
+      }
+      agent {
+          docker {
+              label "${BUILD_ARCH} && ${BUILD_OS}"
+              image env.BUILD_ENV_TAG
+              registryCredentialsId env.BUILD_ENV_CRED
+              registryUrl env.BUILD_ENV_URL
+              args BUILD_ENV_MOUNT_DOCKER_SOCKET
+          }
+      }
+      stages {
+        stage('Build') {
+          steps {
+            unstash 'source'
+            build_for staging
+          }
+          post {
+            failure {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+            aborted {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+          }
+        }
+        stage('Deploy') {
+          steps {
+            deploy_to staging
+          }
+          post {
+            cleanup {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+          }
+        }
+      }
+    }
+    stage('Approve - Prod') {
+      when {
+        expression {
+          return triggered_by('merge', to: master) &&
+          (currentBuild.result != 'ABORTED') &&
+          (!rollback_enabled)
+        }
+      }
+      steps {
+        approve_for prod, waitUntil: CR_TICKET.startTime, allowUntil: CR_TICKET.endTime, approvers: devops_team
+        script {
+          CR_TICKET = get_ticket TICKET_ID
+          echo "Updated Ticket: ${CR_TICKET}"
+          if (CR_TICKET.status != 'Implementing') {
+            env.ERROR = "Ticket must have status 'Implementing' before deploying to production."
+            error(ERROR)
+          }
+        }
+      }
+    }
+    stage('Prod') {
+      when {
+        expression {
+          return triggered_by('merge', to: master) &&
+          (currentBuild.result != 'ABORTED') ||
+          (rollback_enabled)
+        }
+        beforeAgent true
+      }
+      agent {
+          docker {
+              label "${BUILD_ARCH} && ${BUILD_OS}"
+              image env.BUILD_ENV_TAG
+              registryCredentialsId env.BUILD_ENV_CRED
+              registryUrl env.BUILD_ENV_URL
+              args BUILD_ENV_MOUNT_DOCKER_SOCKET
+          }
+      }
+      stages {
+        stage('Build') {
+          steps {
+            unstash 'source'
+            build_for prod
+          }
+          post {
+            failure {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+            aborted {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+          }
+        }
+        stage('Deploy') {
+          steps {
+            deploy_to prod
+          }
+          post {
+            cleanup {
+              cleanWs deleteDirs: true, disableDeferredWipeout: true
+            }
+          }
+        }
+      }
+    }
+  }
+  post {
+    always {
+      send_post_email()
+      script {
+        if (CR_TICKET != null && triggered_by('merge', to: master)) {
+          CR_TICKET = get_ticket TICKET_ID
+          if (CR_TICKET.status == 'Implementing') {
+            add_ticket_comment TICKET_ID
+          }
+        }
+      }
+    }
+    success {
+      echo 'Build succeeded'
+    }
+    failure {
+      echo 'Build failed'
+    }
+  }
+}
