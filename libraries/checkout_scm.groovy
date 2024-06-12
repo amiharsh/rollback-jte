@@ -1,3 +1,3 @@
 void call(String ) {
-    println "Hello From Application Custom Checkout SCM"
+    println "Hello From Rollback JTE"
 }
